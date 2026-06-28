@@ -7,6 +7,7 @@
 //! 3. 最后看 `execute_naked()`：理解“保存调度上下文 <-> 恢复线程上下文”的对称流程。
 
 #![no_std]
+#![allow(unsafe_op_in_unsafe_fn)]
 // #![deny(warnings)]
 #![deny(missing_docs)]
 

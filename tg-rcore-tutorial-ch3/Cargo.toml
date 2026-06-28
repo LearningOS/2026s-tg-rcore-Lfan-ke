@@ -19,6 +19,11 @@ exclude = [
 [features]
 coop = []
 exercise = []
+# 用户态图形贪吃蛇（VirtIO-GPU 帧缓冲 + UART 非阻塞键盘）。
+# 开启后 rust_main 初始化 GPU（静态 DMA 池）并接通自定义 syscall 2000/2001/2002，
+# 同时 build.rs 改用 cases.toml 的 [ch3_game] 用例集（含 snake）。
+# 本章 satp=Bare（无分页），帧缓冲物理地址即用户可直接访问的地址，无需映射。
+game = ["dep:spin", "dep:virtio-drivers"]
 
 [profile.dev]
 panic = "abort"
@@ -28,6 +33,8 @@ panic = "abort"
 
 [dependencies]
 riscv = "0.10.1"
+spin = { version = "0.9", optional = true }
+virtio-drivers = { version = "0.1.0", optional = true }
 
 tg-sbi = { package = "tg-rcore-tutorial-sbi", path = "../tg-rcore-tutorial-sbi", version = "0.4.9", features = ["nobios"] }
 tg-linker = { package = "tg-rcore-tutorial-linker", path = "../tg-rcore-tutorial-linker", version = "0.4.8" }

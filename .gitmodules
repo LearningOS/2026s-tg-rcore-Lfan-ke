@@ -1,0 +1,4 @@
+[submodule "oslab"]
+	path = oslab
+	url = https://github.com/Lfan-ke/hw4os-s5d1t2.git
+	branch = oslab

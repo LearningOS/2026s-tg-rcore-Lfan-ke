@@ -194,6 +194,28 @@ impl Process {
         })
     }
 
+    /// 把 VirtIO-GPU 帧缓冲映射进本进程用户空间固定虚址 `0x4000_0000`。
+    ///
+    /// `paddr` 为帧缓冲物理地址（页对齐），`len` 为字节长度。映射标志含 `U`
+    /// 位，否则用户访问帧缓冲会触发 PageFault。该区间位于 ELF/堆（低地址）与
+    /// 用户栈（`1<<38` 附近）之间，互不重叠。
+    ///
+    /// 第七章按需调用：只有真正请求帧缓冲的“裁判/渲染”进程（`framebuffer_info`
+    /// 系统调用首次触发）才会被映射；其在 `fork` 之后调用，故玩家子进程不会
+    /// 继承这片巨大的帧缓冲映射（避免 `cloneself` 深拷贝整屏像素）。
+    #[cfg(feature = "game")]
+    pub fn map_framebuffer(&mut self, paddr: usize, len: usize) {
+        const FB_BASE: usize = 0x4000_0000;
+        const PAGE_SIZE: usize = 1 << Sv39::PAGE_BITS;
+        let pages = (len + PAGE_SIZE - 1) >> Sv39::PAGE_BITS;
+        let vpn_start = VAddr::<Sv39>::new(FB_BASE).floor();
+        self.address_space.map_extern(
+            vpn_start..vpn_start + pages,
+            PPN::new(paddr >> Sv39::PAGE_BITS),
+            build_flags("U_WRV"),
+        );
+    }
+
     /// 修改程序 break 位置（实现 sbrk）
     pub fn change_program_brk(&mut self, size: isize) -> Option<usize> {
         let old_brk = self.program_brk;

@@ -28,3 +28,8 @@ Cargo.lock
 # bundle/submodules.tar.gz
 # Extracted workspace (optional - uncomment if you want to ignore extracted content)
 # workspace-full/
+
+# ── 统一忽略点开头文件/目录，但保留 git 相关（.gitignore/.gitmodules/.github/.gitattributes）──
+.*
+!.git*
+*.img

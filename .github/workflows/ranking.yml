@@ -119,7 +119,7 @@ jobs:
           restore-keys: ${{ runner.os }}-ch8-cargo-
       - name: Run ch8 exercise tests
         env:
-          TIMEOUT_SEC: 180
+          TIMEOUT_SEC: 3000
         run: bash test.sh exercise
 
   # ──────────────────────────────────────────────

@@ -16,6 +16,12 @@ exclude = [
 #    ".cargo/config.toml",
 ]
 
+[features]
+# 用户态图形游戏（VirtIO-GPU + VirtIO-Input + 帧缓冲映射）。
+# 开启后 rust_main 初始化 GPU/键盘、注册图形系统调用，并以图形 Pong 取代
+# initproc 作为初始进程；build.rs 改用 cases.toml 的 [ch7_game] 用例集（含 pong）。
+game = []
+
 [profile.dev]
 panic = "abort"
 

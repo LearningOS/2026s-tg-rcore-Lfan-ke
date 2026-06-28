@@ -27,7 +27,7 @@ use crate::{
     build_flags, fs::Fd, map_portal, parse_flags, processor::ProcessorInner, Sv39, Sv39Manager,
     PROCESSOR,
 };
-use alloc::{alloc::alloc_zeroed, boxed::Box, sync::Arc, vec::Vec};
+use alloc::{alloc::alloc_zeroed, boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use core::alloc::Layout;
 use spin::Mutex;
 use tg_kernel_context::{foreign::ForeignContext, LocalContext};
@@ -65,6 +65,187 @@ impl Thread {
     }
 }
 
+/// 死锁检测状态（**本章练习新增**）
+///
+/// 基于银行家算法，为 mutex 与 semaphore **分别**维护三组矩阵：
+/// - `available[res]`：第 `res` 类资源当前可用（空闲）数量；
+/// - `allocation[tid][res]`：线程 `tid` 当前已持有第 `res` 类资源的数量；
+/// - `need[tid][res]`：线程 `tid` 当前还在等待的第 `res` 类资源数量。
+///
+/// 线程行（`allocation`/`need`）以全局 `ThreadId` 的整数值为键，资源以
+/// `mutex_list`/`semaphore_list` 中的下标为列。开启检测后，`mutex_lock` 与
+/// `semaphore_down` 在真正获取资源前先把请求加入 `need` 并运行安全性检查，
+/// 若系统进入不安全状态（可能死锁）则撤销请求并返回 `-0xDEAD`。
+#[derive(Default)]
+pub struct DeadlockDetect {
+    /// 是否为当前进程启用死锁检测
+    pub enabled: bool,
+    /// mutex 可用向量
+    pub mutex_available: Vec<isize>,
+    /// mutex 分配矩阵（tid -> 各 mutex 持有数）
+    pub mutex_allocation: BTreeMap<usize, Vec<isize>>,
+    /// mutex 需求矩阵（tid -> 各 mutex 待获取数）
+    pub mutex_need: BTreeMap<usize, Vec<isize>>,
+    /// semaphore 可用向量
+    pub sem_available: Vec<isize>,
+    /// semaphore 分配矩阵（tid -> 各 semaphore 持有数）
+    pub sem_allocation: BTreeMap<usize, Vec<isize>>,
+    /// semaphore 需求矩阵（tid -> 各 semaphore 待获取数）
+    pub sem_need: BTreeMap<usize, Vec<isize>>,
+}
+
+/// 把一行向量扩展到至少 `len` 列（补 0）
+fn grow_row(row: &mut Vec<isize>, len: usize) {
+    while row.len() < len {
+        row.push(0);
+    }
+}
+
+/// 银行家安全性算法：给定 `available`、`allocation`、`need`，
+/// 判断是否存在一种线程执行顺序能让所有线程都顺利结束。
+fn is_safe(
+    available: &[isize],
+    allocation: &BTreeMap<usize, Vec<isize>>,
+    need: &BTreeMap<usize, Vec<isize>>,
+) -> bool {
+    let m = available.len();
+    let mut work: Vec<isize> = available.to_vec();
+    // 参与检测的线程 = 出现在 allocation 中的所有线程
+    let tids: Vec<usize> = allocation.keys().cloned().collect();
+    let mut finish: BTreeMap<usize, bool> = tids.iter().map(|t| (*t, false)).collect();
+    loop {
+        let mut progressed = false;
+        for &t in &tids {
+            if finish[&t] {
+                continue;
+            }
+            let nd = need.get(&t);
+            let runnable = (0..m).all(|j| {
+                let need_tj = nd.and_then(|v| v.get(j)).copied().unwrap_or(0);
+                need_tj <= work[j]
+            });
+            if runnable {
+                if let Some(al) = allocation.get(&t) {
+                    for j in 0..m {
+                        if let Some(v) = al.get(j) {
+                            work[j] += v;
+                        }
+                    }
+                }
+                finish.insert(t, true);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    finish.values().all(|&f| f)
+}
+
+impl DeadlockDetect {
+    /// 设置某类 mutex 资源（容量恒为 1）并清空相关行，列下标为 `id`
+    pub fn mutex_set(&mut self, id: usize) {
+        while self.mutex_available.len() <= id {
+            self.mutex_available.push(0);
+        }
+        self.mutex_available[id] = 1;
+        for row in self.mutex_allocation.values_mut() {
+            grow_row(row, id + 1);
+            row[id] = 0;
+        }
+        for row in self.mutex_need.values_mut() {
+            grow_row(row, id + 1);
+            row[id] = 0;
+        }
+    }
+
+    /// 设置某类 semaphore 资源（容量为 `count`）并清空相关行，列下标为 `id`
+    pub fn sem_set(&mut self, id: usize, count: usize) {
+        while self.sem_available.len() <= id {
+            self.sem_available.push(0);
+        }
+        self.sem_available[id] = count as isize;
+        for row in self.sem_allocation.values_mut() {
+            grow_row(row, id + 1);
+            row[id] = 0;
+        }
+        for row in self.sem_need.values_mut() {
+            grow_row(row, id + 1);
+            row[id] = 0;
+        }
+    }
+
+    /// 确保线程 `tid` 在 mutex 矩阵中存在行
+    fn mutex_thread(&mut self, tid: usize) {
+        let m = self.mutex_available.len();
+        grow_row(self.mutex_allocation.entry(tid).or_default(), m);
+        grow_row(self.mutex_need.entry(tid).or_default(), m);
+    }
+
+    /// 确保线程 `tid` 在 semaphore 矩阵中存在行
+    fn sem_thread(&mut self, tid: usize) {
+        let m = self.sem_available.len();
+        grow_row(self.sem_allocation.entry(tid).or_default(), m);
+        grow_row(self.sem_need.entry(tid).or_default(), m);
+    }
+
+    /// mutex 加锁请求安全性检查：安全返回 `true`（请求已记入 need），
+    /// 不安全返回 `false`（请求已撤销，调用方应返回 -0xDEAD）
+    pub fn mutex_request(&mut self, tid: usize, id: usize) -> bool {
+        self.mutex_thread(tid);
+        self.mutex_need.get_mut(&tid).unwrap()[id] += 1;
+        if is_safe(&self.mutex_available, &self.mutex_allocation, &self.mutex_need) {
+            true
+        } else {
+            self.mutex_need.get_mut(&tid).unwrap()[id] -= 1;
+            false
+        }
+    }
+
+    /// mutex 成功获取：need-1、allocation+1、available-1
+    pub fn mutex_grant(&mut self, tid: usize, id: usize) {
+        self.mutex_thread(tid);
+        self.mutex_need.get_mut(&tid).unwrap()[id] -= 1;
+        self.mutex_allocation.get_mut(&tid).unwrap()[id] += 1;
+        self.mutex_available[id] -= 1;
+    }
+
+    /// mutex 释放：allocation-1、available+1
+    pub fn mutex_release(&mut self, tid: usize, id: usize) {
+        self.mutex_thread(tid);
+        self.mutex_allocation.get_mut(&tid).unwrap()[id] -= 1;
+        self.mutex_available[id] += 1;
+    }
+
+    /// semaphore 获取请求安全性检查（同 mutex_request）
+    pub fn sem_request(&mut self, tid: usize, id: usize) -> bool {
+        self.sem_thread(tid);
+        self.sem_need.get_mut(&tid).unwrap()[id] += 1;
+        if is_safe(&self.sem_available, &self.sem_allocation, &self.sem_need) {
+            true
+        } else {
+            self.sem_need.get_mut(&tid).unwrap()[id] -= 1;
+            false
+        }
+    }
+
+    /// semaphore 成功获取：need-1、allocation+1、available-1
+    pub fn sem_grant(&mut self, tid: usize, id: usize) {
+        self.sem_thread(tid);
+        self.sem_need.get_mut(&tid).unwrap()[id] -= 1;
+        self.sem_allocation.get_mut(&tid).unwrap()[id] += 1;
+        self.sem_available[id] -= 1;
+    }
+
+    /// semaphore 释放：allocation-1、available+1
+    pub fn sem_release(&mut self, tid: usize, id: usize) {
+        self.sem_thread(tid);
+        self.sem_allocation.get_mut(&tid).unwrap()[id] -= 1;
+        self.sem_available[id] += 1;
+    }
+}
+
 /// 进程（资源容器）
 ///
 /// 管理地址空间、文件描述符、同步原语、信号等共享资源。
@@ -84,6 +265,8 @@ pub struct Process {
     pub mutex_list: Vec<Option<Arc<dyn MutexTrait>>>,
     /// 条件变量列表（**本章新增**，所有线程共享）
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// 死锁检测状态（**本章练习新增**）
+    pub deadlock: DeadlockDetect,
 }
 
 impl Process {
@@ -134,6 +317,7 @@ impl Process {
                 semaphore_list: Vec::new(),
                 mutex_list: Vec::new(),
                 condvar_list: Vec::new(),
+                deadlock: DeadlockDetect::default(),
             },
             thread,
         ))
@@ -206,8 +390,30 @@ impl Process {
                 semaphore_list: Vec::new(),
                 mutex_list: Vec::new(),
                 condvar_list: Vec::new(),
+                deadlock: DeadlockDetect::default(),
             },
             thread,
         ))
+    }
+
+    /// 把 VirtIO-GPU 帧缓冲映射进本进程用户空间固定虚址 `0x4000_0000`。
+    ///
+    /// `paddr` 为帧缓冲物理地址（页对齐），`len` 为字节长度。映射标志含 `U`
+    /// 位，否则用户访问帧缓冲会触发 PageFault。该区间位于 ELF/堆（低地址）与
+    /// 用户栈（`1<<38` 附近）之间，互不重叠。
+    ///
+    /// 第八章帧缓冲属于进程、为所有线程共享：DOOM 的渲染线程据此写像素，
+    /// 逻辑线程不触碰它。由 `framebuffer_info` 系统调用首次触发，只映射一次。
+    #[cfg(feature = "game")]
+    pub fn map_framebuffer(&mut self, paddr: usize, len: usize) {
+        const FB_BASE: usize = 0x4000_0000;
+        const PAGE_SIZE: usize = 1 << Sv39::PAGE_BITS;
+        let pages = (len + PAGE_SIZE - 1) >> Sv39::PAGE_BITS;
+        let vpn_start = VAddr::<Sv39>::new(FB_BASE).floor();
+        self.address_space.map_extern(
+            vpn_start..vpn_start + pages,
+            PPN::new(paddr >> Sv39::PAGE_BITS),
+            build_flags("U_WRV"),
+        );
     }
 }

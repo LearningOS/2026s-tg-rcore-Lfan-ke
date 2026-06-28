@@ -342,12 +342,16 @@ mod impls {
     use crate::{
         build_flags,
         fs::{read_all, FS},
+        parse_flags,
         process::Process as ProcStruct,
         processor::ProcManager,
         Sv39, PROCESSOR,
     };
     use alloc::vec::Vec;
-    use alloc::{alloc::alloc_zeroed, string::String};
+    use alloc::{
+        alloc::{alloc_zeroed, dealloc},
+        string::String,
+    };
     use core::{alloc::Layout, ptr::NonNull};
     use spin::Mutex;
     use tg_console::log;
@@ -414,11 +418,25 @@ mod impls {
             *flags |= Self::OWNED;
             NonNull::new(Self::page_alloc(len)).unwrap()
         }
-        fn deallocate(&mut self, _pte: Pte<Sv39>, _len: usize) -> usize {
-            todo!()
+        fn deallocate(&mut self, pte: Pte<Sv39>, len: usize) -> usize {
+            unsafe {
+                dealloc(
+                    self.p_to_v::<u8>(pte.ppn()).as_ptr(),
+                    Layout::from_size_align_unchecked(
+                        len << Sv39::PAGE_BITS,
+                        1 << Sv39::PAGE_BITS,
+                    ),
+                );
+            }
+            len
         }
         fn drop_root(&mut self) {
-            todo!()
+            unsafe {
+                dealloc(
+                    self.root_ptr().as_ptr().cast::<u8>(),
+                    Layout::from_size_align_unchecked(1 << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS),
+                );
+            }
         }
     }
 
@@ -443,6 +461,26 @@ mod impls {
     const READABLE: VmFlags<Sv39> = build_flags("RV");
     /// 可写权限标志
     const WRITEABLE: VmFlags<Sv39> = build_flags("W_V");
+
+    /// 从用户地址空间读取一个以 '\0' 结尾的字符串（路径）。
+    ///
+    /// 翻译用户虚拟地址后逐字符读取，遇到 '\0' 结束。地址不可读时返回 None。
+    fn translate_user_str(current: &ProcStruct, ptr: usize) -> Option<String> {
+        let mut raw = current
+            .address_space
+            .translate::<u8>(VAddr::new(ptr), READABLE)?
+            .as_ptr();
+        let mut string = String::new();
+        loop {
+            let ch = unsafe { *raw };
+            if ch == 0 {
+                break;
+            }
+            string.push(ch as char);
+            raw = unsafe { raw.add(1) };
+        }
+        Some(string)
+    }
 
     /// IO 系统调用实现：read、write、open、close
     ///
@@ -581,34 +619,75 @@ mod impls {
 
         /// linkat 系统调用：创建硬链接
         ///
-        /// TODO: 实现 linkat 系统调用（练习题）
+        /// 翻译用户态的 oldpath/newpath 字符串，在根目录中让 newpath 指向
+        /// 与 oldpath 相同的 inode。新旧同名或源文件不存在时返回 -1。
         fn linkat(
             &self,
             _caller: Caller,
             _olddirfd: i32,
-            _oldpath: usize,
+            oldpath: usize,
             _newdirfd: i32,
-            _newpath: usize,
+            newpath: usize,
             _flags: u32,
         ) -> isize {
-            tg_console::log::info!("linkat: not implemented");
-            -1
+            let current = PROCESSOR.get_mut().current().unwrap();
+            match (
+                translate_user_str(current, oldpath),
+                translate_user_str(current, newpath),
+            ) {
+                (Some(old), Some(new)) => FS.link(old.as_str(), new.as_str()),
+                _ => -1,
+            }
         }
 
         /// unlinkat 系统调用：删除硬链接
         ///
-        /// TODO: 实现 unlinkat 系统调用（练习题）
-        fn unlinkat(&self, _caller: Caller, _dirfd: i32, _path: usize, _flags: u32) -> isize {
-            tg_console::log::info!("unlinkat: not implemented");
-            -1
+        /// 翻译用户态的 path 字符串，移除对应目录项并递减 nlink；当 nlink
+        /// 归零时回收 inode 与数据块。文件不存在返回 -1。
+        fn unlinkat(&self, _caller: Caller, _dirfd: i32, path: usize, _flags: u32) -> isize {
+            let current = PROCESSOR.get_mut().current().unwrap();
+            match translate_user_str(current, path) {
+                Some(name) => FS.unlink(name.as_str()),
+                None => -1,
+            }
         }
 
         /// fstat 系统调用：获取文件状态
         ///
-        /// TODO: 实现 fstat 系统调用（练习题）
-        fn fstat(&self, _caller: Caller, _fd: usize, _st: usize) -> isize {
-            tg_console::log::info!("fstat: not implemented");
-            -1
+        /// 通过 fd 找到打开文件的 inode，读取其 (ino, nlink, 类型)，
+        /// 翻译用户态 `st` 指针并写回 `Stat` 结构体。
+        fn fstat(&self, _caller: Caller, fd: usize, st: usize) -> isize {
+            let current = PROCESSOR.get_mut().current().unwrap();
+            if fd >= current.fd_table.len() {
+                return -1;
+            }
+            let Some(file) = &current.fd_table[fd] else {
+                return -1;
+            };
+            let file = file.lock();
+            let Some(inode) = &file.inode else {
+                return -1;
+            };
+            let (ino, nlink, is_dir) = inode.stat();
+            if let Some(mut ptr) = current
+                .address_space
+                .translate::<Stat>(VAddr::new(st), WRITEABLE)
+            {
+                let mut stat = Stat::new();
+                stat.dev = 0;
+                stat.ino = ino as u64;
+                stat.mode = if is_dir {
+                    StatMode::DIR
+                } else {
+                    StatMode::FILE
+                };
+                stat.nlink = nlink;
+                unsafe { *ptr.as_mut() = stat };
+                0
+            } else {
+                log::error!("fstat: st ptr not writable");
+                -1
+            }
         }
     }
 
@@ -693,14 +772,40 @@ mod impls {
             current.pid.get_usize() as _
         }
 
-        /// spawn 系统调用（TODO 练习题）
-        fn spawn(&self, _caller: Caller, _path: usize, _count: usize) -> isize {
-            let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "spawn: parent pid = {}, not implemented",
-                current.pid.get_usize()
-            );
-            -1
+        /// spawn 系统调用：从文件系统加载 ELF 直接创建并调度新进程
+        ///
+        /// 与 fork+exec 不同，spawn 无需复制父进程地址空间，而是直接从磁盘
+        /// 上的目标程序构建全新进程。父进程返回子进程 PID，失败返回 -1。
+        fn spawn(&self, _caller: Caller, path: usize, count: usize) -> isize {
+            const READABLE: VmFlags<Sv39> = build_flags("RV");
+            let processor: *mut PManager<ProcStruct, ProcManager> = PROCESSOR.get_mut() as *mut _;
+            let current = unsafe { (*processor).current().unwrap() };
+            let parent_pid = current.pid;
+            // 将用户态路径字符串翻译到内核可访问的物理地址
+            let name = match current
+                .address_space
+                .translate::<u8>(VAddr::new(path), READABLE)
+            {
+                Some(ptr) => unsafe {
+                    core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr.as_ptr(), count))
+                },
+                None => return -1,
+            };
+            // 从文件系统读取 ELF 并直接构建新进程
+            match FS.open(name, OpenFlags::RDONLY) {
+                Some(fd) => {
+                    let data = read_all(fd);
+                    match ElfFile::new(&data).ok().and_then(ProcStruct::from_elf) {
+                        Some(child) => {
+                            let pid = child.pid;
+                            unsafe { (*processor).add(pid, child, parent_pid) };
+                            pid.get_usize() as isize
+                        }
+                        None => -1,
+                    }
+                }
+                None => -1,
+            }
         }
 
         /// sbrk 系统调用：调整堆大小
@@ -765,7 +870,10 @@ mod impls {
 
     /// 内存管理系统调用实现
     impl Memory for SyscallContext {
-        /// mmap 系统调用（TODO 练习题）
+        /// mmap 系统调用：在当前进程地址空间匿名映射一段内存
+        ///
+        /// addr 必须页对齐，prot 仅低 3 位（R/W/X）有效且不能全为 0，
+        /// 目标区间不得与已映射区间重叠。
         fn mmap(
             &self,
             _caller: Caller,
@@ -776,16 +884,61 @@ mod impls {
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
-            );
-            -1
+            const PAGE_SIZE: usize = 1 << Sv39::PAGE_BITS;
+            if addr % PAGE_SIZE != 0 {
+                return -1;
+            }
+            if prot & !0x7 != 0 || prot & 0x7 == 0 {
+                return -1;
+            }
+            let current = PROCESSOR.get_mut().current().unwrap();
+            let start = VAddr::<Sv39>::new(addr).floor();
+            let end = VAddr::<Sv39>::new(addr + len).ceil();
+            for area in &current.address_space.areas {
+                if area.start < end && start < area.end {
+                    return -1;
+                }
+            }
+            let mut flags: [u8; 5] = *b"U___V";
+            if prot & 0x1 != 0 {
+                flags[3] = b'R';
+            }
+            if prot & 0x2 != 0 {
+                flags[2] = b'W';
+            }
+            if prot & 0x4 != 0 {
+                flags[1] = b'X';
+            }
+            let vmflags = parse_flags(unsafe { core::str::from_utf8_unchecked(&flags) }).unwrap();
+            current.address_space.map(start..end, &[], 0, vmflags);
+            0
         }
 
-        /// munmap 系统调用（TODO 练习题）
+        /// munmap 系统调用：取消当前进程地址空间的内存映射
+        ///
+        /// 区间向上取整到整页，区间内所有页都必须已映射，否则返回 -1。
         fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+            const PAGE_SIZE: usize = 1 << Sv39::PAGE_BITS;
+            if addr % PAGE_SIZE != 0 {
+                return -1;
+            }
+            let current = PROCESSOR.get_mut().current().unwrap();
+            let start = VAddr::<Sv39>::new(addr).floor();
+            let end = VAddr::<Sv39>::new(addr + len).ceil();
+            let mut vpn = start;
+            while vpn < end {
+                let mapped = current
+                    .address_space
+                    .areas
+                    .iter()
+                    .any(|a| a.start <= vpn && vpn < a.end);
+                if !mapped {
+                    return -1;
+                }
+                vpn = vpn + 1;
+            }
+            current.address_space.unmap(start..end);
+            0
         }
     }
 }

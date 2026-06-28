@@ -365,7 +365,8 @@ fn map_portal(space: &AddressSpace<Sv39, Sv39Manager>) {
 /// 包括 IO、Process、Scheduling、Clock、Memory 等系统调用接口。
 mod impls {
     use crate::{
-        build_flags, process::Process as ProcStruct, processor::ProcManager, Sv39, APPS, PROCESSOR,
+        build_flags, parse_flags, process::Process as ProcStruct, processor::ProcManager, Sv39,
+        APPS, PROCESSOR,
     };
     use alloc::alloc::alloc_zeroed;
     use core::{alloc::Layout, ptr::NonNull};
@@ -450,12 +451,32 @@ mod impls {
             NonNull::new(Self::page_alloc(len)).unwrap()
         }
 
-        fn deallocate(&mut self, _pte: Pte<Sv39>, _len: usize) -> usize {
-            todo!()
+        /// 释放 `pte` 指向的 `len` 个物理页（与 ch4 的填空一致）
+        fn deallocate(&mut self, pte: Pte<Sv39>, len: usize) -> usize {
+            let p = self.p_to_v::<u8>(pte.ppn());
+            unsafe {
+                alloc::alloc::dealloc(
+                    p.as_ptr(),
+                    Layout::from_size_align_unchecked(
+                        len << Sv39::PAGE_BITS,
+                        1 << Sv39::PAGE_BITS,
+                    ),
+                );
+            }
+            len
         }
 
+        /// 释放根页表所在的物理页（1 页）
         fn drop_root(&mut self) {
-            todo!()
+            unsafe {
+                alloc::alloc::dealloc(
+                    self.0.as_ptr() as *mut u8,
+                    Layout::from_size_align_unchecked(
+                        1 << Sv39::PAGE_BITS,
+                        1 << Sv39::PAGE_BITS,
+                    ),
+                );
+            }
         }
     }
 
@@ -640,17 +661,36 @@ mod impls {
 
         /// spawn 系统调用：创建新进程并直接执行指定程序
         ///
-        /// 与 fork+exec 不同，spawn 直接从 ELF 创建新进程，
-        /// 无需复制父进程地址空间。
-        ///
-        /// TODO: 实现 spawn 系统调用（练习题）
-        fn spawn(&self, _caller: Caller, _path: usize, _count: usize) -> isize {
-            let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "spawn: parent pid = {}, not implemented",
-                current.pid.get_usize()
-            );
-            -1
+        /// 与 fork+exec 不同，spawn 直接从目标程序的 ELF 创建一个全新进程，
+        /// 无需复制父进程地址空间。父进程返回子进程 PID，失败返回 -1。
+        fn spawn(&self, _caller: Caller, path: usize, count: usize) -> isize {
+            const READABLE: VmFlags<Sv39> = build_flags("RV");
+            let processor: *mut PManager<ProcStruct, ProcManager> = PROCESSOR.get_mut() as *mut _;
+            let current = unsafe { (*processor).current().unwrap() };
+            let parent_pid = current.pid;
+            // 将用户态路径字符串翻译到内核可访问的物理地址
+            let name = match current
+                .address_space
+                .translate::<u8>(VAddr::new(path), READABLE)
+            {
+                Some(ptr) => unsafe {
+                    core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr.as_ptr(), count))
+                },
+                None => return -1,
+            };
+            // 查找目标程序并从其 ELF 直接构建新进程
+            match APPS.get(name).and_then(|input| ElfFile::new(input).ok()) {
+                Some(elf) => match ProcStruct::from_elf(elf) {
+                    Some(child) => {
+                        let pid = child.pid;
+                        // 设置父子关系并加入进程管理器
+                        unsafe { (*processor).add(pid, child, parent_pid) };
+                        pid.get_usize() as isize
+                    }
+                    None => -1,
+                },
+                None => -1,
+            }
         }
 
         /// sbrk 系统调用：调整进程堆空间大小
@@ -676,17 +716,17 @@ mod impls {
             0
         }
 
-        /// set_priority 系统调用：设置当前进程优先级
+        /// set_priority 系统调用：设置当前进程优先级（stride 调度）
         ///
-        /// TODO: 实现 set_priority 系统调用（练习题：stride 调度算法）
+        /// 要求 `prio >= 2`，合法时设置当前进程优先级并返回 prio，否则返回 -1。
         fn set_priority(&self, _caller: Caller, prio: isize) -> isize {
-            let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "set_priority: pid = {}, prio = {}, not implemented",
-                current.pid.get_usize(),
+            if prio >= 2 {
+                let current = PROCESSOR.get_mut().current().unwrap();
+                current.priority = prio as usize;
                 prio
-            );
-            -1
+            } else {
+                -1
+            }
         }
     }
 
@@ -726,9 +766,10 @@ mod impls {
 
     /// 内存管理系统调用实现
     impl Memory for SyscallContext {
-        /// mmap 系统调用：映射匿名内存
+        /// mmap 系统调用：在当前进程地址空间映射匿名内存
         ///
-        /// TODO: 实现 mmap 系统调用（练习题）
+        /// 校验：地址页对齐、prot 仅占低 3 位且非 0、目标区间未被映射；
+        /// 然后根据 prot 构建页属性（R/W/X + U + V）并建立映射。成功返回 0，否则 -1。
         fn mmap(
             &self,
             _caller: Caller,
@@ -739,18 +780,68 @@ mod impls {
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
-            );
-            -1
+            const PAGE_SIZE: usize = 1 << Sv39::PAGE_BITS;
+            // 地址必须页对齐
+            if addr % PAGE_SIZE != 0 {
+                return -1;
+            }
+            // prot 只能使用低 3 位（R/W/X），且不能全为 0
+            if prot & !0x7 != 0 || prot & 0x7 == 0 {
+                return -1;
+            }
+            let current = PROCESSOR.get_mut().current().unwrap();
+            let start = VAddr::<Sv39>::new(addr).floor();
+            let end = VAddr::<Sv39>::new(addr + len).ceil();
+            // 目标区间不能与已映射区间重叠
+            for area in &current.address_space.areas {
+                if area.start < end && start < area.end {
+                    return -1;
+                }
+            }
+            // 根据 prot 构建页属性：U_XWRV
+            let mut flags: [u8; 5] = *b"U___V";
+            if prot & 0x1 != 0 {
+                flags[3] = b'R';
+            }
+            if prot & 0x2 != 0 {
+                flags[2] = b'W';
+            }
+            if prot & 0x4 != 0 {
+                flags[1] = b'X';
+            }
+            let vmflags = parse_flags(unsafe { core::str::from_utf8_unchecked(&flags) }).unwrap();
+            current.address_space.map(start..end, &[], 0, vmflags);
+            0
         }
 
-        /// munmap 系统调用：取消内存映射
+        /// munmap 系统调用：取消当前进程地址空间的内存映射
         ///
-        /// TODO: 实现 munmap 系统调用（练习题）
+        /// 区间向上取整到整页，区间内所有页都必须已映射，否则返回 -1；
+        /// 否则取消映射并返回 0。
         fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+            const PAGE_SIZE: usize = 1 << Sv39::PAGE_BITS;
+            // 地址必须页对齐
+            if addr % PAGE_SIZE != 0 {
+                return -1;
+            }
+            let current = PROCESSOR.get_mut().current().unwrap();
+            let start = VAddr::<Sv39>::new(addr).floor();
+            let end = VAddr::<Sv39>::new(addr + len).ceil();
+            // 区间内每一页都必须已经映射
+            let mut vpn = start;
+            while vpn < end {
+                let mapped = current
+                    .address_space
+                    .areas
+                    .iter()
+                    .any(|a| a.start <= vpn && vpn < a.end);
+                if !mapped {
+                    return -1;
+                }
+                vpn = vpn + 1;
+            }
+            current.address_space.unmap(start..end);
+            0
         }
     }
 }

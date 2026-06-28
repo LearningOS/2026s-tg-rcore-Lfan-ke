@@ -18,6 +18,12 @@ exclude = [
 
 [features]
 exercise = []
+# 用户态图形游戏（VirtIO-GPU + VirtIO-Input + 帧缓冲映射）。
+# 开启后 rust_main 初始化 GPU/键盘、注册图形系统调用，并以图形 DOOM 风
+# 射线投射 FPS 取代 initproc 作为初始进程；该进程用 ch8 线程把「输入/逻辑」
+# 与「渲染」分离、用 ch8 Mutex 保护共享状态、从 easy-fs 读关卡迷宫。
+# build.rs 改用 cases.toml 的 [ch8_game] 用例集（含 doom）并把关卡打进 fs.img。
+game = []
 
 [profile.dev]
 panic = "abort"

@@ -21,6 +21,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TG_USER_LOCAL_DIR");
     println!("cargo:rerun-if-env-changed=TG_SKIP_USER_APPS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EXERCISE");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GAME");
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
@@ -80,7 +81,11 @@ fn build_apps_and_pack_fs() {
         panic!("failed to parse cases.toml: {err}")
     });
 
-    let case_key = if env::var("CARGO_FEATURE_EXERCISE").is_ok() {
+    // feature = "game" 时改用 [ch8_game] 用例集（仅含图形 DOOM），
+    // 其余情况沿用默认 [ch8] / [ch8_exercise]，不影响判题路径。
+    let case_key = if env::var("CARGO_FEATURE_GAME").is_ok() {
+        "ch8_game"
+    } else if env::var("CARGO_FEATURE_EXERCISE").is_ok() {
         "ch8_exercise"
     } else {
         "ch8"
@@ -132,6 +137,14 @@ fn build_user_app(tg_user_root: &PathBuf, name: &str, base_address: u64) {
     if base_address != 0 {
         cmd.env("BASE_ADDRESS", base_address.to_string());
     }
+
+    // 用户程序是第三方发布的 crate，不应受内核侧严格 lint 约束。其含 deny(warnings) 且
+    // 部分并发用例（mpsc_sem 等）带 rust_2024 的 unsafe_op_in_unsafe_fn 警告，在严格工具链
+    // 下会升级为错误、导致用户程序编译失败（CI 下表现为应用跑不起来）。统一 cap-lints=allow，
+    // 把继承自父构建的任何 lint 级别（含 -D warnings）封顶为 allow，仅影响告警、不改代码生成。
+    let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    rustflags.push_str(" --cap-lints=allow");
+    cmd.env("RUSTFLAGS", rustflags);
 
     let status = cmd.status().expect("failed to execute cargo build for user app");
     if !status.success() {
@@ -192,7 +205,65 @@ fn easy_fs_pack(
         inode.write_at(0, all_data.as_slice());
     }
 
+    // feature = "game" 时把 DOOM 关卡迷宫作为一个普通文件打进 easy-fs。
+    // 游戏启动后用 open/read 从文件系统读它解析——体现第八章的文件系统。
+    if env::var("CARGO_FEATURE_GAME").is_ok() {
+        let level = doom_level_bytes();
+        let inode = root_inode.create("doom.map").unwrap();
+        inode.write_at(0, level.as_slice());
+    }
+
     Ok(())
+}
+
+/// 生成 DOOM 关卡文件的字节内容。
+///
+/// 二进制格式（小端、紧凑）：
+/// - `[0]` = 宽 W（列数）
+/// - `[1]` = 高 H（行数）
+/// - `[2..2+W*H]` = 行优先的网格单元，`0` = 空地，`1..` = 墙（墙的取值即“墙色 id”）
+///
+/// 这是一张 16×16 的迷宫：外圈封墙，内部四组中空方柱，墙 id 在 1/2/3 间变化
+/// 以呈现多种墙色。玩家出生于开阔处 `(8.0, 8.0)`，朝东可看到纵深与多根立柱。
+fn doom_level_bytes() -> Vec<u8> {
+    // '#'=外墙(1)，'2'/'3'=带色立柱，'.'=空地
+    const ROWS: [&str; 16] = [
+        "################",
+        "#..............#",
+        "#..............#",
+        "#..2222..3333..#",
+        "#..2..2..3..3..#",
+        "#..2..2..3..3..#",
+        "#..2222..3333..#",
+        "#..............#",
+        "#..............#",
+        "#..3333..2222..#",
+        "#..3..3..2..2..#",
+        "#..3..3..2..2..#",
+        "#..3333..2222..#",
+        "#..............#",
+        "#..............#",
+        "################",
+    ];
+    let h = ROWS.len();
+    let w = ROWS[0].len();
+    let mut out: Vec<u8> = Vec::with_capacity(2 + w * h);
+    out.push(w as u8);
+    out.push(h as u8);
+    for row in ROWS.iter() {
+        assert_eq!(row.len(), w, "all maze rows must have equal width");
+        for ch in row.bytes() {
+            let cell = match ch {
+                b'.' => 0u8,
+                b'#' => 1u8,
+                b'2' => 2u8,
+                b'3' => 3u8,
+                other => panic!("unknown maze cell char: {}", other as char),
+            };
+            out.push(cell);
+        }
+    }
+    out
 }
 
 fn ensure_tg_user() -> PathBuf {

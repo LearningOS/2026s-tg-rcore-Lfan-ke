@@ -176,6 +176,27 @@ pub trait Trace: Sync {
     }
 }
 
+/// 图形 / 输入子系统接口（自定义 syscall 2000/2001/2002）。
+///
+/// 由内核实现，向用户态暴露 VirtIO-GPU 帧缓冲与 VirtIO-Input 键盘。
+/// 设计为可选子系统：未 `init_gpu` 的章节调用这些 syscall 返回 `Unsupported`。
+pub trait Gpu: Sync {
+    /// 把帧缓冲信息（虚址 / 长度 / 分辨率）填回 `info` 指向的用户 `FbInfo`。
+    ///
+    /// 成功返回 0，用户指针不可写返回 -1。
+    fn framebuffer_info(&self, caller: Caller, info: usize) -> isize {
+        unimplemented!()
+    }
+    /// 把帧缓冲内容推送到屏幕（VirtIO-GPU flush）。成功返回 0。
+    fn gpu_flush(&self, caller: Caller) -> isize {
+        unimplemented!()
+    }
+    /// 非阻塞读取一个按键，返回 evdev 键码（`>0`）；无按键返回 0。
+    fn key_event(&self, caller: Caller) -> isize {
+        unimplemented!()
+    }
+}
+
 static PROCESS: Container<dyn Process> = Container::new();
 static IO: Container<dyn IO> = Container::new();
 static MEMORY: Container<dyn Memory> = Container::new();
@@ -185,6 +206,7 @@ static SIGNAL: Container<dyn Signal> = Container::new();
 static THREAD: Container<dyn Thread> = Container::new();
 static SYNC_MUTEX: Container<dyn SyncMutex> = Container::new();
 static TRACE: Container<dyn Trace> = Container::new();
+static GPU: Container<dyn Gpu> = Container::new();
 
 #[inline]
 pub fn init_process(process: &'static dyn Process) {
@@ -229,6 +251,11 @@ pub fn init_sync_mutex(sync_mutex: &'static dyn SyncMutex) {
 #[inline]
 pub fn init_trace(trace: &'static dyn Trace) {
     TRACE.init(trace);
+}
+
+#[inline]
+pub fn init_gpu(gpu: &'static dyn Gpu) {
+    GPU.init(gpu);
 }
 
 pub enum SyscallResult {
@@ -317,6 +344,9 @@ pub fn handle(caller: Caller, id: SyscallId, args: [usize; 6]) -> SyscallResult 
         Id::SETPRIORITY => SCHEDULING.call(id, |sched| sched.set_priority(caller, args[0] as _)),
         Id::BRK => PROCESS.call(id, |proc| proc.sbrk(caller, args[0] as _)),
         Id::PIPE2 => IO.call(id, |io| io.pipe(caller, args[0])),
+        Id::FRAMEBUFFER_INFO => GPU.call(id, |gpu| gpu.framebuffer_info(caller, args[0])),
+        Id::GPU_FLUSH => GPU.call(id, |gpu| gpu.gpu_flush(caller)),
+        Id::KEY_EVENT => GPU.call(id, |gpu| gpu.key_event(caller)),
         _ => SyscallResult::Unsupported(id),
     }
 }

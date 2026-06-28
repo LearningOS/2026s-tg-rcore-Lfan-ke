@@ -20,6 +20,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TG_USER_CRATE");
     println!("cargo:rerun-if-env-changed=TG_USER_LOCAL_DIR");
     println!("cargo:rerun-if-env-changed=TG_SKIP_USER_APPS");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GAME");
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
@@ -79,13 +80,20 @@ fn build_apps_and_pack_fs() {
         panic!("failed to parse cases.toml: {err}")
     });
 
-    let cases = cases_map.remove("ch7").unwrap_or_default();
+    // feature = "game" 时改用 [ch7_game] 用例集（仅含图形 Pong），
+    // 其余情况沿用默认 [ch7]，不影响判题路径。
+    let case_key = if env::var("CARGO_FEATURE_GAME").is_ok() {
+        "ch7_game"
+    } else {
+        "ch7"
+    };
+    let cases = cases_map.remove(case_key).unwrap_or_default();
     let base = cases.base.unwrap_or(0);
     let step = cases.step.unwrap_or(0);
     let names = cases.cases.unwrap_or_default();
 
     if names.is_empty() {
-        panic!("no user cases found for ch7 in {}", cases_path.display());
+        panic!("no user cases found for {case_key} in {}", cases_path.display());
     }
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());

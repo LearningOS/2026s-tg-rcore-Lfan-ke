@@ -321,6 +321,11 @@
 #define __NR_trace 410
 #define __NR_enable_deadlock_detect 469
 
+// 自定义图形 / 输入系统调用（大实验共享基建，ch3~ch8 通用）
+#define __NR_framebuffer_info 2000
+#define __NR_gpu_flush 2001
+#define __NR_key_event 2002
+
 
 // #define __NR_sysriscv __NR_arch_specific_syscall
 // #define __NR_riscv_flush_icache (__NR_sysriscv + 15)

@@ -83,12 +83,20 @@ impl TaskControlBlock {
     ///
     /// 从用户上下文中提取系统调用 ID（a7 寄存器）和参数（a0-a5 寄存器），
     /// 分发到对应的处理函数，并将返回值写回 a0 寄存器。
-    pub fn handle_syscall(&mut self) -> SchedulingEvent {
+    pub fn handle_syscall(&mut self, idx: usize) -> SchedulingEvent {
         use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
         use SchedulingEvent as Event;
 
         // a7 寄存器存放 syscall ID
         let id = self.ctx.a(7).into();
+        // 计入本次系统调用（trace 请求 2 要求“含当前调用”）：按任务下标 idx 写全局计数表。
+        // 用 `&raw mut` 取裸指针，避免 deny(warnings) 下的 static_mut_refs 报错。
+        let Id(num) = id;
+        if num < crate::MAX_SYSCALL {
+            unsafe {
+                (*(&raw mut crate::SYSCALL_COUNT))[idx][num] += 1;
+            }
+        }
         // a0-a5 寄存器存放系统调用参数
         let args = [
             self.ctx.a(0),
@@ -98,7 +106,7 @@ impl TaskControlBlock {
             self.ctx.a(4),
             self.ctx.a(5),
         ];
-        match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
+        match tg_syscall::handle(Caller { entity: idx, flow: 0 }, id, args) {
             Ret::Done(ret) => match id {
                 // exit 系统调用：返回退出事件
                 Id::EXIT => Event::Exit(self.ctx.a(0)),

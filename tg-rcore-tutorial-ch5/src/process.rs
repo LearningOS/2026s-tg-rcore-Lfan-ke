@@ -50,6 +50,10 @@ pub struct Process {
     pub heap_bottom: usize,
     /// 当前程序 break 位置（堆顶），通过 sbrk 调整
     pub program_brk: usize,
+    /// 进程优先级（stride 调度），初始 16，最小 2
+    pub priority: usize,
+    /// 进程已运行的“步数”（stride 调度），初始 0
+    pub stride: usize,
 }
 
 impl Process {
@@ -89,6 +93,9 @@ impl Process {
             address_space,
             heap_bottom: self.heap_bottom,
             program_brk: self.program_brk,
+            // 子进程继承父进程优先级，但 stride 重新从 0 开始
+            priority: self.priority,
+            stride: 0,
         })
     }
 
@@ -192,6 +199,9 @@ impl Process {
             address_space,
             heap_bottom,
             program_brk: heap_bottom,
+            // stride 调度：初始优先级 16，初始 stride 0
+            priority: 16,
+            stride: 0,
         })
     }
 

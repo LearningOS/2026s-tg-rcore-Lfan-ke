@@ -17,7 +17,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TG_USER_VERSION");
     println!("cargo:rerun-if-env-changed=TG_USER_CRATE");
     println!("cargo:rerun-if-env-changed=TG_USER_LOCAL_DIR");
+    println!("cargo:rerun-if-env-changed=TG_SKIP_USER_APPS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EXERCISE");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GAME");
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
@@ -77,6 +79,8 @@ fn build_apps() {
 
     let case_key = if env::var("CARGO_FEATURE_EXERCISE").is_ok() {
         "ch3_exercise"
+    } else if env::var("CARGO_FEATURE_GAME").is_ok() {
+        "ch3_game"
     } else {
         "ch3"
     };

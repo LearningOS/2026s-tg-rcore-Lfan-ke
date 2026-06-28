@@ -29,6 +29,14 @@
 // 任务管理模块：定义任务控制块（TCB）和调度事件
 mod task;
 
+// 图形贪吃蛇基建（feature = "game"）：VirtIO-GPU 帧缓冲（静态 DMA 池）+ UART 键盘。
+#[cfg(feature = "game")]
+mod game_alloc;
+#[cfg(feature = "game")]
+mod gpu;
+#[cfg(feature = "game")]
+mod input;
+
 // 引入控制台输出宏（print! / println!），由 tg_console 库提供
 #[macro_use]
 extern crate tg_console;
@@ -53,6 +61,17 @@ core::arch::global_asm!(include_str!(env!("APP_ASM")));
 
 // 最大支持的应用程序数量
 const APP_CAPACITY: usize = 32;
+
+/// 系统调用计数表按调用号索引的长度（需覆盖最大调用号 SYS_TRACE=410）。
+const MAX_SYSCALL: usize = 512;
+
+/// 每个任务按系统调用号统计的累计调用次数（供 `trace` 请求 2 查询）。
+///
+/// 放在 `.bss` 全局区而非 `TaskControlBlock`：内核栈仅 `(APP_CAPACITY+2)*8 KiB`，
+/// 而 `tcbs` 已在栈上占用约 `APP_CAPACITY*8 KiB`，再把 `[u32; MAX_SYSCALL]` 内联进 TCB
+/// 会溢出内核栈。按「任务下标 × 调用号」二维计数，保证各任务计数相互隔离
+/// （时钟抢占会让多个任务交替执行）。
+static mut SYSCALL_COUNT: [[u32; MAX_SYSCALL]; APP_CAPACITY] = [[0; MAX_SYSCALL]; APP_CAPACITY];
 
 // 定义内核入口点：分配 (APP_CAPACITY + 2) * 8 KiB = 272 KiB 的内核栈
 // 比第二章更大，因为需要同时容纳多个任务的内核上下文。
@@ -103,6 +122,14 @@ extern "C" fn rust_main() -> ! {
     tg_syscall::init_clock(&SyscallContext);
     tg_syscall::init_trace(&SyscallContext);
 
+    // 第三步半：初始化图形 / 输入子系统并接通自定义 syscall 2000/2001/2002。
+    // Bare 模式下 MMIO 与帧缓冲均可直接访问，无需建立映射；GPU 用静态 DMA 池。
+    #[cfg(feature = "game")]
+    {
+        gpu::init();
+        tg_syscall::init_gpu(&SyscallContext);
+    }
+
     // 第四步：初始化任务控制块数组，加载所有用户程序
     let mut tcbs = [TaskControlBlock::ZERO; APP_CAPACITY];
     let mut index_mod = 0;
@@ -149,7 +176,7 @@ extern "C" fn rust_main() -> ! {
                     // ─── 系统调用：用户程序执行了 ecall 指令 ───
                     Trap::Exception(Exception::UserEnvCall) => {
                         use task::SchedulingEvent as Event;
-                        match tcb.handle_syscall() {
+                        match tcb.handle_syscall(i) {
                             // 普通系统调用（如 write）：处理完成后继续运行当前任务
                             Event::None => continue,
                             // exit 系统调用：任务主动退出
@@ -294,24 +321,80 @@ mod impls {
         }
     }
 
-    /// Trace 系统调用实现（练习题需要完成的部分）
+    /// Trace 系统调用实现。
     ///
-    /// 当前为占位实现，返回 -1 表示未实现。
-    /// 学生需要在练习中实现 trace 功能，支持：
-    /// - 读取用户内存（trace_request=0）
-    /// - 写入用户内存（trace_request=1）
-    /// - 查询系统调用计数（trace_request=2）
+    /// 三种请求（由 `trace_request` 区分）：
+    /// - `0` 读取用户内存：返回 `id` 处一字节（0..=255），失败返回 -1；
+    /// - `1` 写入用户内存：把 `data` 的低 8 位写入 `id` 处，返回 0；
+    /// - `2` 查询系统调用计数：返回**当前任务**对调用号 `id` 的累计次数（含本次 trace 调用）。
+    ///
+    /// 本章 satp=Bare（恒等映射），S 态可直接访问用户内存，故读写即裸指针解引用。
+    /// 计数取自全局 [`SYSCALL_COUNT`]，任务下标由 `caller.entity` 携带
+    /// （见 `task::TaskControlBlock::handle_syscall`）。
     impl Trace for SyscallContext {
         #[inline]
         fn trace(
             &self,
-            _caller: Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
+            caller: Caller,
+            trace_request: usize,
+            id: usize,
+            data: usize,
         ) -> isize {
-            tg_console::log::info!("trace: not implemented");
-            -1
+            match trace_request {
+                // 读用户内存一字节
+                0 => unsafe { (id as *const u8).read_volatile() as isize },
+                // 写用户内存一字节
+                1 => unsafe {
+                    (id as *mut u8).write_volatile(data as u8);
+                    0
+                },
+                // 查询当前任务对调用号 id 的累计次数（`&raw const` 避免 static_mut_refs 警告）
+                2 => {
+                    if id < crate::MAX_SYSCALL {
+                        unsafe { (*(&raw const crate::SYSCALL_COUNT))[caller.entity][id] as isize }
+                    } else {
+                        0
+                    }
+                }
+                _ => -1,
+            }
+        }
+    }
+
+    /// 图形 / 输入系统调用实现（自定义 syscall 2000/2001/2002）。
+    ///
+    /// 本章 satp=Bare（恒等映射），帧缓冲物理地址即用户可直接访问的虚址，
+    /// 故 `framebuffer_info` 直接把 [`crate::gpu::fb_paddr`] 回填给用户 `FbInfo`，
+    /// 无需像第四章那样建立用户页表映射，用户随后直写该指针即可渲染。
+    ///
+    /// - `framebuffer_info`：把帧缓冲地址 / 长度 / 分辨率写回用户 `FbInfo`
+    /// - `gpu_flush`：触发 VirtIO-GPU flush，把帧缓冲推到屏幕
+    /// - `key_event`：非阻塞读取一个 UART 按键（映射为 evdev 键码）
+    #[cfg(feature = "game")]
+    impl Gpu for SyscallContext {
+        #[inline]
+        fn framebuffer_info(&self, _caller: Caller, info: usize) -> isize {
+            // SAFETY: Bare 模式下用户指针即物理地址，S 态可直接写回 FbInfo。
+            unsafe {
+                *(info as *mut FbInfo) = FbInfo {
+                    ptr: crate::gpu::fb_paddr(),
+                    len: crate::gpu::fb_len(),
+                    width: crate::gpu::fb_width(),
+                    height: crate::gpu::fb_height(),
+                };
+            }
+            0
+        }
+
+        #[inline]
+        fn gpu_flush(&self, _caller: Caller) -> isize {
+            crate::gpu::flush();
+            0
+        }
+
+        #[inline]
+        fn key_event(&self, _caller: Caller) -> isize {
+            crate::input::poll_key().map_or(0, |code| code as isize)
         }
     }
 }

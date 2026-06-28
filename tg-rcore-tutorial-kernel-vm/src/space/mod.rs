@@ -50,8 +50,16 @@ impl<Meta: VmMeta, M: PageManager<Meta>> AddressSpace<Meta, M> {
         let mut mapper = Mapper::new(self, pbase..pbase + count, flags);
         root.walk_mut(Pos::new(range.start, 0), &mut mapper);
         if !mapper.ans() {
-            // 映射失败，需要回滚吗？
-            todo!()
+            // 走到这里：目标 VPN 区间与一个「非本地址空间所有」(全局/共享) 的中间页表
+            // 子树相撞（见 mapper.rs::meet 返回 None 即停止遍历）。这是地址空间布局错误，
+            // 而非运行时可恢复状况——页表页分配不足会在 page_manager.allocate 内直接 panic。
+            // map_extern 返回 ()，无法把失败传给调用方；继续运行只会留下「半建立」的映射，
+            // 因此显式 panic 暴露布局 bug（此路径在正确的进程/内核布局下不会触发）。
+            panic!(
+                "map_extern: VPN range [{:#x}, {:#x}) collides with a non-owned page-table subtree",
+                range.start.val(),
+                range.end.val()
+            );
         }
     }
 

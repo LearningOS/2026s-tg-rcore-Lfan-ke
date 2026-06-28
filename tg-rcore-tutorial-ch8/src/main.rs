@@ -55,6 +55,13 @@ mod processor;
 /// VirtIO 块设备驱动
 mod virtio_block;
 
+// 图形游戏基建（feature = "game"）：VirtIO-GPU 帧缓冲 + VirtIO-Input 键盘。
+// 与第七章一致（块设备 bus.0、GPU bus.1、键盘 bus.2），HAL 走 KERNEL_SPACE 翻译。
+#[cfg(feature = "game")]
+mod gpu;
+#[cfg(feature = "game")]
+mod input;
+
 #[macro_use]
 extern crate tg_console;
 
@@ -200,8 +207,21 @@ extern "C" fn rust_main() -> ! {
     tg_syscall::init_signal(&SyscallContext);
     tg_syscall::init_thread(&SyscallContext);       // 本章新增：线程系统调用
     tg_syscall::init_sync_mutex(&SyscallContext);   // 本章新增：同步原语系统调用
-    // 步骤 8：加载 initproc（返回 Process + Thread）
-    let initproc = read_all(FS.open("initproc", OpenFlags::RDONLY).unwrap());
+    // 步骤 7.5（feature = "game"）：初始化 VirtIO-GPU 与键盘，并注册图形系统调用。
+    // 必须在 kernel_space（KERNEL_SPACE 写入 + GPU/键盘 MMIO 映射）之后。
+    #[cfg(feature = "game")]
+    {
+        gpu::init();
+        tg_syscall::init_gpu(&SyscallContext);
+    }
+    // 步骤 8：加载初始进程（返回 Process + Thread）。
+    // 默认判题路径加载 initproc；feature = "game" 直接加载图形 DOOM 风射线投射
+    // FPS，由它创建逻辑/渲染两个线程、从 easy-fs 读关卡迷宫。
+    #[cfg(not(feature = "game"))]
+    let init_name = "initproc";
+    #[cfg(feature = "game")]
+    let init_name = "doom";
+    let initproc = read_all(FS.open(init_name, OpenFlags::RDONLY).unwrap());
     if let Some((process, thread)) = Process::from_elf(ElfFile::new(initproc.as_slice()).unwrap()) {
         // 初始化双层管理器：ProcManager（进程）+ ThreadManager（线程）
         PROCESSOR.get_mut().set_proc_manager(ProcManager::new());
@@ -329,6 +349,19 @@ fn kernel_space(layout: tg_linker::KernelLayout, memory: usize, portal: usize) {
             build_flags("_WRV"),
         );
     }
+    // 图形游戏额外映射 GPU（bus.1 = 0x1000_2000）与键盘（bus.2 = 0x1000_3000）
+    // 的 MMIO 寄存器，供 gpu.rs / input.rs 驱动直访（内核专属，恒等映射）。
+    #[cfg(feature = "game")]
+    for base in [0x1000_2000usize, 0x1000_3000] {
+        let s = VAddr::<Sv39>::new(base);
+        let e = VAddr::<Sv39>::new(base + 0x1000);
+        log::info!("MMIO range -> {:#10x}..{:#10x}", s.val(), e.val());
+        space.map_extern(
+            s.floor()..e.ceil(),
+            PPN::new(s.floor().val()),
+            build_flags("_WRV"),
+        );
+    }
     unsafe { satp::set(satp::Mode::Sv39, 0, space.root_ppn().val()) };
     unsafe { KERNEL_SPACE.write(space) };
 }
@@ -410,8 +443,26 @@ mod impls {
             *flags |= Self::OWNED;
             NonNull::new(Self::page_alloc(len)).unwrap()
         }
-        fn deallocate(&mut self, _pte: Pte<Sv39>, _len: usize) -> usize { todo!() }
-        fn drop_root(&mut self) { todo!() }
+        /// 释放 `pte` 指向的 `len` 个物理页（与 ch4 的填空一致）
+        fn deallocate(&mut self, pte: Pte<Sv39>, len: usize) -> usize {
+            let p = self.p_to_v::<u8>(pte.ppn());
+            unsafe {
+                alloc::alloc::dealloc(
+                    p.as_ptr(),
+                    Layout::from_size_align_unchecked(len << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS),
+                );
+            }
+            len
+        }
+        /// 释放根页表所在的物理页（1 页）
+        fn drop_root(&mut self) {
+            unsafe {
+                alloc::alloc::dealloc(
+                    self.0.as_ptr() as *mut u8,
+                    Layout::from_size_align_unchecked(1 << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS),
+                );
+            }
+        }
     }
 
     // ─── 控制台 ───
@@ -729,15 +780,27 @@ mod impls {
                 current_proc.semaphore_list.push(Some(Arc::new(Semaphore::new(res_count))));
                 current_proc.semaphore_list.len() - 1
             };
+            // 死锁检测：登记该信号量为一类资源，容量 = res_count
+            current_proc.deadlock.sem_set(id, res_count);
             id as isize
         }
 
         /// V 操作：释放信号量，唤醒等待线程
         fn semaphore_up(&self, _caller: Caller, sem_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+            let upper = unsafe { (*processor).current().unwrap() }.tid.get_usize();
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            let enabled = current_proc.deadlock.enabled;
             let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
-            if let Some(tid) = sem.up() {
+            let waking = sem.up();
+            if enabled {
+                // 释放者交还一个资源，若有等待线程则把资源转交给它
+                current_proc.deadlock.sem_release(upper, sem_id);
+                if let Some(tid) = waking {
+                    current_proc.deadlock.sem_grant(tid.get_usize(), sem_id);
+                }
+            }
+            if let Some(tid) = waking {
                 unsafe { (*processor).re_enque(tid); }
             }
             0
@@ -749,8 +812,22 @@ mod impls {
             let current = unsafe { (*processor).current().unwrap() };
             let tid = current.tid;
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            // 死锁检测：先把请求记入 need 并做安全性检查
+            if current_proc.deadlock.enabled
+                && !current_proc.deadlock.sem_request(tid.get_usize(), sem_id)
+            {
+                return -0xDEAD;
+            }
+            let enabled = current_proc.deadlock.enabled;
             let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
-            if !sem.down(tid) { -1 } else { 0 }
+            if sem.down(tid) {
+                // 立即获取成功：need→allocation
+                if enabled { current_proc.deadlock.sem_grant(tid.get_usize(), sem_id); }
+                0
+            } else {
+                // 阻塞：请求保留在 need 中，待 up 转交时再记入 allocation
+                -1
+            }
         }
 
         /// 创建互斥锁（blocking=true 为阻塞锁）
@@ -759,23 +836,36 @@ mod impls {
                 Some(Arc::new(MutexBlocking::new()))
             } else { None };
             let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
-            if let Some(id) = current_proc.mutex_list.iter().enumerate()
+            let id = if let Some(id) = current_proc.mutex_list.iter().enumerate()
                 .find(|(_, item)| item.is_none()).map(|(id, _)| id)
             {
                 current_proc.mutex_list[id] = new_mutex;
-                id as isize
+                id
             } else {
                 current_proc.mutex_list.push(new_mutex);
-                current_proc.mutex_list.len() as isize - 1
-            }
+                current_proc.mutex_list.len() - 1
+            };
+            // 死锁检测：登记该互斥锁为一类资源，容量 = 1
+            current_proc.deadlock.mutex_set(id);
+            id as isize
         }
 
         /// 解锁，唤醒等待线程
         fn mutex_unlock(&self, _caller: Caller, mutex_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+            let upper = unsafe { (*processor).current().unwrap() }.tid.get_usize();
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            let enabled = current_proc.deadlock.enabled;
             let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
-            if let Some(tid) = mutex.unlock() {
+            let waking = mutex.unlock();
+            if enabled {
+                // 释放者交还锁，若有等待线程则把锁转交给它
+                current_proc.deadlock.mutex_release(upper, mutex_id);
+                if let Some(tid) = waking {
+                    current_proc.deadlock.mutex_grant(tid.get_usize(), mutex_id);
+                }
+            }
+            if let Some(tid) = waking {
                 unsafe { (*processor).re_enque(tid); }
             }
             0
@@ -787,8 +877,22 @@ mod impls {
             let current = unsafe { (*processor).current().unwrap() };
             let tid = current.tid;
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            // 死锁检测：先把请求记入 need 并做安全性检查
+            if current_proc.deadlock.enabled
+                && !current_proc.deadlock.mutex_request(tid.get_usize(), mutex_id)
+            {
+                return -0xDEAD;
+            }
+            let enabled = current_proc.deadlock.enabled;
             let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
-            if !mutex.lock(tid) { -1 } else { 0 }
+            if mutex.lock(tid) {
+                // 立即获取成功：need→allocation
+                if enabled { current_proc.deadlock.mutex_grant(tid.get_usize(), mutex_id); }
+                0
+            } else {
+                // 阻塞：请求保留在 need 中，待 unlock 转交时再记入 allocation
+                -1
+            }
         }
 
         /// 创建条件变量
@@ -832,10 +936,66 @@ mod impls {
             if !flag { -1 } else { 0 }
         }
 
-        /// 死锁检测（TODO 练习题）
+        /// 死锁检测开关（**本章练习**）
+        ///
+        /// `is_enable == 1` 启用，`0` 禁用，其它值视为参数非法返回 -1。
         fn enable_deadlock_detect(&self, _caller: Caller, is_enable: i32) -> isize {
-            tg_console::log::info!("enable_deadlock_detect: is_enable = {is_enable}, not implemented");
-            -1
+            let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
+            match is_enable {
+                1 => { current_proc.deadlock.enabled = true; 0 }
+                0 => { current_proc.deadlock.enabled = false; 0 }
+                _ => -1,
+            }
+        }
+    }
+
+    /// 图形 / 输入系统调用实现（自定义 syscall 2000/2001/2002）。
+    ///
+    /// 帧缓冲属于**进程**（`get_current_proc`），故 DOOM 进程内的所有线程都
+    /// 共享同一片 `0x4000_0000` 映射——渲染线程写像素、逻辑线程读输入互不干扰。
+    /// `framebuffer_info` 首次调用时按需把帧缓冲映射进进程地址空间。
+    #[cfg(feature = "game")]
+    impl Gpu for SyscallContext {
+        fn framebuffer_info(&self, _caller: Caller, info: usize) -> isize {
+            const FB_BASE: usize = 0x4000_0000;
+            // 帧缓冲是否已映射进本进程（含 U 位即视为已映射）。
+            const MAPPED: VmFlags<Sv39> = build_flags("U_V");
+            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            if current
+                .address_space
+                .translate::<u8>(VAddr::new(FB_BASE), MAPPED)
+                .is_none()
+            {
+                current.map_framebuffer(crate::gpu::fb_paddr(), crate::gpu::fb_len());
+            }
+            // 用户传入的 FbInfo 指针需可写（用户栈，含 U 位）。
+            const WRITABLE: VmFlags<Sv39> = build_flags("U_WV");
+            if let Some(mut ptr) = current
+                .address_space
+                .translate::<FbInfo>(VAddr::new(info), WRITABLE)
+            {
+                *unsafe { ptr.as_mut() } = FbInfo {
+                    ptr: FB_BASE,
+                    len: crate::gpu::fb_len(),
+                    width: crate::gpu::fb_width(),
+                    height: crate::gpu::fb_height(),
+                };
+                0
+            } else {
+                log::error!("framebuffer_info: user ptr not writable");
+                -1
+            }
+        }
+
+        #[inline]
+        fn gpu_flush(&self, _caller: Caller) -> isize {
+            crate::gpu::flush();
+            0
+        }
+
+        #[inline]
+        fn key_event(&self, _caller: Caller) -> isize {
+            crate::input::poll_key().map_or(0, |code| code as isize)
         }
     }
 }

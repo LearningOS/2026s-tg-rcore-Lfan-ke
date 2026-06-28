@@ -28,6 +28,16 @@
 // 启用 nobios 特性后，tg_sbi 内建了 M-mode 启动代码，无需外部 SBI 固件
 use tg_sbi::{console_putchar, shutdown};
 
+// 内核态七巧板（tangram）图形游戏（feature = "game"）。
+// 第一章极裸（无 U 态 / trap / syscall），故游戏直接在 S 态内核里渲染：
+// init VirtIO-GPU（无堆静态 DMA 池）→ 整数多边形填充画七巧板 → flush。
+#[cfg(feature = "game")]
+mod game_alloc;
+#[cfg(feature = "game")]
+mod gpu;
+#[cfg(feature = "game")]
+mod tangram;
+
 /// S 态程序入口点。
 ///
 /// 这是一个裸函数（naked function），放置在 `.text.entry` 段，
@@ -42,8 +52,11 @@ use tg_sbi::{console_putchar, shutdown};
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 unsafe extern "C" fn _start() -> ! {
-    // 栈大小：4 KiB
+    // 栈大小：默认 4 KiB；开启 game 后内核态要跑 VirtIO-GPU 初始化与渲染，放大到 64 KiB。
+    #[cfg(not(feature = "game"))]
     const STACK_SIZE: usize = 4096;
+    #[cfg(feature = "game")]
+    const STACK_SIZE: usize = 64 * 1024;
 
     // 在 .bss.uninit 段中分配栈空间
     #[unsafe(link_section = ".bss.uninit")]
@@ -66,6 +79,16 @@ extern "C" fn rust_main() -> ! {
     for c in b"Hello, world!\n" {
         console_putchar(*c);
     }
+
+    // game：保留 "Hello, world!" 横幅后，初始化 GPU 并进入七巧板渲染循环（永不返回）。
+    // 第一章 Bare 模式下 MMIO 与帧缓冲均可由 S 态直接访问，无需建立任何页表映射。
+    // 两条路径用 cfg 互斥，避免 game 下 shutdown 成为「不可达代码」触发 deny(warnings)。
+    #[cfg(feature = "game")]
+    {
+        gpu::init();
+        tangram::run()
+    }
+    #[cfg(not(feature = "game"))]
     shutdown(false) // false 表示正常关机
 }
 

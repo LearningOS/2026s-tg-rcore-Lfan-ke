@@ -65,8 +65,18 @@ impl FSManager for FileSystem {
         Some(self.root.readdir())
     }
 
-    fn link(&self, _src: &str, _dst: &str) -> isize { unimplemented!() }
-    fn unlink(&self, _path: &str) -> isize { unimplemented!() }
+    /// 创建硬链接：`dst` 与 `src` 指向同一 inode 并递增 nlink；自链接报错。
+    fn link(&self, src: &str, dst: &str) -> isize {
+        if src == dst {
+            return -1;
+        }
+        self.root.link(src, dst)
+    }
+
+    /// 删除硬链接：移除 `path` 目录项并递减 nlink，归零时回收 inode 与数据块。
+    fn unlink(&self, path: &str) -> isize {
+        self.root.unlink(path)
+    }
 }
 
 /// 读取文件全部内容到 Vec<u8>

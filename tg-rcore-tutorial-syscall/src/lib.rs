@@ -10,6 +10,7 @@
 compile_error!("You can only use one of `supervisor` or `user` features at a time");
 
 mod fs;
+mod gpu;
 mod io;
 mod time;
 
@@ -17,6 +18,7 @@ include!(concat!(env!("OUT_DIR"), "/syscalls.rs"));
 // 由构建脚本生成的 syscall 编号常量（与课程章节保持同步）。
 
 pub use fs::*;
+pub use gpu::*;
 pub use io::*;
 pub use tg_signal_defs::{SignalAction, SignalNo, MAX_SIG};
 pub use time::*;

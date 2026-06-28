@@ -100,15 +100,45 @@ impl Manage<Process, ProcId> for ProcManager {
     }
 }
 
-/// 实现 Schedule trait：进程调度（当前为 FIFO/RR）
+/// stride 调度算法的大步长常量 `BigStride`。
+///
+/// 进程每次被调度后 `stride += BIG_STRIDE / priority`。
+/// 取值需足够大以减小整数除法误差，又要避免长时间运行时溢出反转。
+/// `1 << 40` 对 64 位 usize 而言，即使运行上百万个调度轮次也不会溢出。
+const BIG_STRIDE: usize = 1 << 40;
+
+/// 实现 Schedule trait：stride 调度算法
+///
+/// 每次调度时从就绪队列中挑选 `stride` 最小的进程运行，
+/// 运行后将其 `stride` 增加 `BIG_STRIDE / priority`，
+/// 从而使高优先级进程获得成比例更多的 CPU 时间。
 impl Schedule<ProcId> for ProcManager {
-    /// 将进程加入就绪队列尾部
+    /// 将进程加入就绪队列
     fn add(&mut self, id: ProcId) {
         self.ready_queue.push_back(id);
     }
 
-    /// 从就绪队列头部取出下一个要执行的进程
+    /// 从就绪队列中取出 stride 最小的进程，并累加其 stride
     fn fetch(&mut self) -> Option<ProcId> {
-        self.ready_queue.pop_front()
+        if self.ready_queue.is_empty() {
+            return None;
+        }
+        // 暴力扫描就绪队列，挑选 stride 最小的进程（相等时取队首，保持 FIFO）
+        let mut best_idx = 0usize;
+        let mut best_stride = usize::MAX;
+        for (i, id) in self.ready_queue.iter().enumerate() {
+            let stride = self.tasks.get(id).map_or(usize::MAX, |p| p.stride);
+            if stride < best_stride {
+                best_stride = stride;
+                best_idx = i;
+            }
+        }
+        let id = self.ready_queue.remove(best_idx)?;
+        // 被调度的进程累加步长 pass = BIG_STRIDE / priority
+        if let Some(task) = self.tasks.get_mut(&id) {
+            let priority = task.priority.max(2);
+            task.stride = task.stride.wrapping_add(BIG_STRIDE / priority);
+        }
+        Some(id)
     }
 }

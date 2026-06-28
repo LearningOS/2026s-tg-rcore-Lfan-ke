@@ -12,6 +12,12 @@ readme = "README.md"
 keywords = ["rcore", "tutorial", "no-std", "riscv", "bare-metal"]
 categories = ["no-std", "embedded"]
 
+[features]
+# 内核态七巧板（tangram）图形游戏：VirtIO-GPU 帧缓冲（无堆静态 DMA 池）+ 整数多边形填充。
+# 第一章极裸（无 U 态 / trap / 进程 / syscall），故游戏直接在 S 态内核里渲染，
+# 不影响默认判题路径（不开 game 时不链接 virtio，`./test.sh` 仍打印 "Hello, world!"）。
+game = ["dep:spin", "dep:virtio-drivers", "dep:riscv"]
+
 [profile.dev]
 panic = "abort"
 
@@ -20,3 +26,7 @@ panic = "abort"
 
 [dependencies]
 tg-sbi = { package = "tg-rcore-tutorial-sbi", path = "../tg-rcore-tutorial-sbi", version = "0.4.9", features = ["nobios"] }
+# 以下仅在 feature = "game" 时启用（optional），默认判题路径不编译。
+spin = { version = "0.9", optional = true }
+virtio-drivers = { version = "0.1.0", optional = true }
+riscv = { version = "0.10.1", optional = true }

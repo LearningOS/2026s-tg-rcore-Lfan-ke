@@ -82,14 +82,20 @@ impl FSManager for FileSystem {
         Some(self.root.readdir())
     }
 
-    /// 创建硬链接（TODO 练习题）
-    fn link(&self, _src: &str, _dst: &str) -> isize {
-        unimplemented!()
+    /// 创建硬链接：在根目录中让 `dst` 指向 `src` 所引用的同一个 inode。
+    ///
+    /// 新旧名字一致属于错误，返回 -1；源文件不存在也返回 -1。
+    fn link(&self, src: &str, dst: &str) -> isize {
+        if src == dst {
+            return -1;
+        }
+        self.root.link(src, dst)
     }
 
-    /// 删除硬链接（TODO 练习题）
-    fn unlink(&self, _path: &str) -> isize {
-        unimplemented!()
+    /// 删除硬链接：移除 `path` 目录项并递减 nlink，
+    /// 当 nlink 归零时回收 inode 及其数据块。
+    fn unlink(&self, path: &str) -> isize {
+        self.root.unlink(path)
     }
 }
 

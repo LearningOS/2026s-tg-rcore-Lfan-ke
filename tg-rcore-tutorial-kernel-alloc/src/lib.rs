@@ -6,6 +6,7 @@
 //! - 再看 `HEAP` / `GlobalAlloc`：理解 Rust `alloc` 如何落到内核堆实现。
 
 #![no_std]
+#![allow(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
 extern crate alloc;

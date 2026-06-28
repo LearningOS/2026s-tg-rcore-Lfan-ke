@@ -30,6 +30,12 @@
 // 进程管理模块：定义 Process 结构体，包含地址空间和上下文
 mod process;
 
+// 图形游戏基建（feature = "game"）：VirtIO-GPU 帧缓冲 + VirtIO-Input 键盘。
+#[cfg(feature = "game")]
+mod gpu;
+#[cfg(feature = "game")]
+mod input;
+
 // 引入控制台输出宏（print! / println!），由 tg_console 库提供
 #[macro_use]
 extern crate tg_console;
@@ -176,12 +182,24 @@ extern "C" fn rust_main() -> ! {
     // 第五步：建立内核地址空间（恒等映射 + 传送门映射）
     let mut ks = kernel_space(layout, MEMORY, portal_ptr as _);
     let portal_idx = PROTAL_TRANSIT.index_in(Sv39::MAX_LEVEL);
+    // 第五步半：初始化 VirtIO-GPU 与键盘。
+    // 必须在内核地址空间建立、MMIO 区域映射完成之后，且早于创建用户进程
+    // （进程创建时需要帧缓冲物理地址来建立用户映射）。
+    #[cfg(feature = "game")]
+    gpu::init();
     // 第六步：加载用户程序
     // 解析每个 ELF 文件，创建独立地址空间，映射传送门
     for (i, elf) in tg_linker::AppMeta::locate().iter().enumerate() {
         let base = elf.as_ptr() as usize;
         log::info!("detect app[{i}]: {base:#x}..{:#x}", base + elf.len());
         if let Some(process) = Process::new(ElfFile::new(elf).unwrap()) {
+            // 把 VirtIO-GPU 帧缓冲映射进该进程用户空间固定虚址 0x4000_0000
+            #[cfg(feature = "game")]
+            let process = {
+                let mut process = process;
+                process.map_framebuffer(gpu::fb_paddr(), gpu::fb_len());
+                process
+            };
             // 将内核传送门页表项共享到用户地址空间
             // 这样传送门在两个地址空间的虚拟地址相同
             process.address_space.root()[portal_idx] = ks.root()[portal_idx];
@@ -229,6 +247,9 @@ extern "C" fn schedule() -> ! {
     tg_syscall::init_clock(&SyscallContext);
     tg_syscall::init_trace(&SyscallContext);
     tg_syscall::init_memory(&SyscallContext);
+    // 图形 / 输入子系统（自定义 syscall 2000/2001/2002）
+    #[cfg(feature = "game")]
+    tg_syscall::init_gpu(&SyscallContext);
 
     // 调度循环：持续执行直到所有进程完成
     while !unsafe { PROCESSES.get_mut().is_empty() } {
@@ -247,8 +268,15 @@ extern "C" fn schedule() -> ! {
                 use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
 
                 let ctx = &mut ctx.context;
-                let id: Id = ctx.a(7).into();
+                let syscall_id = ctx.a(7);
+                let id: Id = syscall_id.into();
                 let args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
+                // 统计当前进程的系统调用次数（含本次调用，供 trace 请求 2 查询）
+                if let Some(p) = unsafe { PROCESSES.get_mut() }.get_mut(0) {
+                    if syscall_id < p.syscall_count.len() {
+                        p.syscall_count[syscall_id] += 1;
+                    }
+                }
                 match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
                     Ret::Done(ret) => match id {
                         // exit：移除进程
@@ -343,6 +371,19 @@ fn kernel_space(
         PPN::new(portal >> Sv39::PAGE_BITS),
         build_flags("__G_XWRV"),
     );
+    // 映射 VirtIO MMIO 设备寄存器（GPU=bus.0, 键盘=bus.1），供驱动直访。
+    // 内核专属（无 U 位），恒等映射。
+    #[cfg(feature = "game")]
+    for base in [0x1000_1000usize, 0x1000_2000] {
+        let s = VAddr::<Sv39>::new(base);
+        let e = VAddr::<Sv39>::new(base + 0x1000);
+        log::info!("MMIO range -> {:#10x}..{:#10x}", s.val(), e.val());
+        space.map_extern(
+            s.floor()..e.ceil(),
+            PPN::new(s.floor().val()),
+            build_flags("_WRV"),
+        );
+    }
     println!();
     // 激活内核地址空间：写入 satp 寄存器，开启 Sv39 分页模式
     unsafe { satp::set(satp::Mode::Sv39, 0, space.root_ppn().val()) };
@@ -357,7 +398,7 @@ fn kernel_space(
 /// 用户传入的指针是虚拟地址，内核需要通过页表将其翻译为物理地址才能访问。
 mod impls {
     use crate::{build_flags, Sv39, PROCESSES};
-    use alloc::alloc::alloc_zeroed;
+    use alloc::alloc::{alloc_zeroed, dealloc};
     use core::{alloc::Layout, ptr::NonNull};
     use tg_console::log;
     use tg_kernel_vm::{
@@ -432,12 +473,34 @@ mod impls {
             NonNull::new(Self::page_alloc(len)).unwrap()
         }
 
-        fn deallocate(&mut self, _pte: Pte<Sv39>, _len: usize) -> usize {
-            todo!()
+        /// 释放 `pte` 指示的 `len` 个物理页（`allocate` 的逆操作）。
+        #[inline]
+        fn deallocate(&mut self, pte: Pte<Sv39>, len: usize) -> usize {
+            let p = self.p_to_v::<u8>(pte.ppn());
+            unsafe {
+                dealloc(
+                    p.as_ptr(),
+                    Layout::from_size_align_unchecked(
+                        len << Sv39::PAGE_BITS,
+                        1 << Sv39::PAGE_BITS,
+                    ),
+                );
+            }
+            len
         }
 
+        /// 释放根页表所在的物理页（1 页）。
+        #[inline]
         fn drop_root(&mut self) {
-            todo!()
+            unsafe {
+                dealloc(
+                    self.0.as_ptr() as *mut u8,
+                    Layout::from_size_align_unchecked(
+                        1 << Sv39::PAGE_BITS,
+                        1 << Sv39::PAGE_BITS,
+                    ),
+                );
+            }
         }
     }
 
@@ -565,13 +628,95 @@ mod impls {
         #[inline]
         fn trace(
             &self,
-            _caller: Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
+            caller: Caller,
+            trace_request: usize,
+            id: usize,
+            data: usize,
         ) -> isize {
-            tg_console::log::info!("trace: not implemented");
-            -1
+            let process = match unsafe { PROCESSES.get_mut() }.get_mut(caller.entity) {
+                Some(p) => p,
+                None => return -1,
+            };
+            match trace_request {
+                // 读取用户虚地址 `id` 处的一个字节，返回其值（0..=255），
+                // 若该地址用户不可见或不可读则返回 -1。
+                // 注意必须要求 U 标志：否则内核共享页（如传送门页）会被误判为可读。
+                0 => {
+                    const READABLE: VmFlags<Sv39> = build_flags("U_RV");
+                    match process
+                        .address_space
+                        .translate::<u8>(VAddr::new(id), READABLE)
+                    {
+                        Some(ptr) => unsafe { *ptr.as_ptr() as isize },
+                        None => -1,
+                    }
+                }
+                // 将 `data` 的低 8 位写入用户虚地址 `id` 处，成功返回 0，
+                // 若该地址用户不可见或不可写则返回 -1。
+                1 => {
+                    const WRITABLE: VmFlags<Sv39> = build_flags("U_WV");
+                    match process
+                        .address_space
+                        .translate::<u8>(VAddr::new(id), WRITABLE)
+                    {
+                        Some(ptr) => {
+                            unsafe { *ptr.as_ptr() = data as u8 };
+                            0
+                        }
+                        None => -1,
+                    }
+                }
+                // 查询本进程对系统调用号 `id` 的累计调用次数。
+                2 => {
+                    if id < process.syscall_count.len() {
+                        process.syscall_count[id] as isize
+                    } else {
+                        -1
+                    }
+                }
+                _ => -1,
+            }
+        }
+    }
+
+    /// 图形 / 输入系统调用实现（自定义 syscall 2000/2001/2002）。
+    ///
+    /// - `framebuffer_info`：把帧缓冲虚址/长度/分辨率写回用户 `FbInfo`
+    /// - `gpu_flush`：触发 VirtIO-GPU flush，把帧缓冲推到屏幕
+    /// - `key_event`：非阻塞读取一个 VirtIO-Input 按键
+    #[cfg(feature = "game")]
+    impl Gpu for SyscallContext {
+        fn framebuffer_info(&self, caller: Caller, info: usize) -> isize {
+            // 用户传入的 FbInfo 指针需可写（用户栈，含 U 位）。
+            const WRITABLE: VmFlags<Sv39> = build_flags("U_WV");
+            if let Some(mut ptr) = unsafe { PROCESSES.get_mut() }
+                .get_mut(caller.entity)
+                .unwrap()
+                .address_space
+                .translate::<FbInfo>(VAddr::new(info), WRITABLE)
+            {
+                *unsafe { ptr.as_mut() } = FbInfo {
+                    ptr: 0x4000_0000,
+                    len: crate::gpu::fb_len(),
+                    width: crate::gpu::fb_width(),
+                    height: crate::gpu::fb_height(),
+                };
+                0
+            } else {
+                log::error!("framebuffer_info: user ptr not writable");
+                -1
+            }
+        }
+
+        #[inline]
+        fn gpu_flush(&self, _caller: Caller) -> isize {
+            crate::gpu::flush();
+            0
+        }
+
+        #[inline]
+        fn key_event(&self, _caller: Caller) -> isize {
+            crate::input::poll_key().map_or(0, |code| code as isize)
         }
     }
 
@@ -582,7 +727,7 @@ mod impls {
     impl Memory for SyscallContext {
         fn mmap(
             &self,
-            _caller: Caller,
+            caller: Caller,
             addr: usize,
             len: usize,
             prot: i32,
@@ -590,15 +735,75 @@ mod impls {
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
-            );
-            -1
+            const PAGE_MASK: usize = (1 << Sv39::PAGE_BITS) - 1;
+            let prot = prot as usize;
+            // 参数校验：地址按页对齐、prot 高位为 0、prot 低 3 位非 0。
+            if addr & PAGE_MASK != 0 || prot & !0x7 != 0 || prot & 0x7 == 0 {
+                return -1;
+            }
+            let process = match unsafe { PROCESSES.get_mut() }.get_mut(caller.entity) {
+                Some(p) => p,
+                None => return -1,
+            };
+            // len 按页向上取整。
+            let pages = (len + PAGE_MASK) >> Sv39::PAGE_BITS;
+            if pages == 0 {
+                return 0;
+            }
+            let vpn_start = VAddr::<Sv39>::new(addr).floor();
+            let vpn_end = vpn_start + pages;
+            // [addr, addr + len) 中不得存在已映射的页。
+            for area in &process.address_space.areas {
+                if area.start < vpn_end && vpn_start < area.end {
+                    return -1;
+                }
+            }
+            // 由 prot 构造页属性：bit0=R bit1=W bit2=X，并始终附加 U + V。
+            let mut flags = build_flags("U_V");
+            if prot & 0x1 != 0 {
+                flags |= build_flags("R");
+            }
+            if prot & 0x2 != 0 {
+                flags |= build_flags("W");
+            }
+            if prot & 0x4 != 0 {
+                flags |= build_flags("X");
+            }
+            // 匿名映射：分配新物理页，无初始数据。
+            process.address_space.map(vpn_start..vpn_end, &[], 0, flags);
+            0
         }
 
-        fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+        fn munmap(&self, caller: Caller, addr: usize, len: usize) -> isize {
+            const PAGE_MASK: usize = (1 << Sv39::PAGE_BITS) - 1;
+            if addr & PAGE_MASK != 0 {
+                return -1;
+            }
+            let process = match unsafe { PROCESSES.get_mut() }.get_mut(caller.entity) {
+                Some(p) => p,
+                None => return -1,
+            };
+            let pages = (len + PAGE_MASK) >> Sv39::PAGE_BITS;
+            if pages == 0 {
+                return 0;
+            }
+            let vpn_start = VAddr::<Sv39>::new(addr).floor();
+            let vpn_end = vpn_start + pages;
+            // [addr, addr + len) 中每一页都必须已被映射。
+            let mut vpn = vpn_start;
+            while vpn < vpn_end {
+                if !process
+                    .address_space
+                    .areas
+                    .iter()
+                    .any(|a| a.start <= vpn && vpn < a.end)
+                {
+                    return -1;
+                }
+                vpn = vpn + 1;
+            }
+            process.address_space.unmap(vpn_start..vpn_end);
+            0
         }
     }
 }

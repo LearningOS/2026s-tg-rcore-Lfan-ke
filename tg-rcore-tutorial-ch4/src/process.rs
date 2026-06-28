@@ -21,6 +21,7 @@
 
 use crate::{build_flags, parse_flags, Sv39, Sv39Manager};
 use alloc::alloc::alloc_zeroed;
+use alloc::boxed::Box;
 use core::alloc::Layout;
 use tg_console::log;
 use tg_kernel_context::{foreign::ForeignContext, LocalContext};
@@ -33,6 +34,9 @@ use xmas_elf::{
     program, ElfFile,
 };
 
+/// 系统调用计数表长度（按系统调用号索引，需覆盖最大的系统调用号）。
+pub const MAX_SYSCALL: usize = 512;
+
 /// 进程结构体
 ///
 /// 包含进程运行所需的全部信息：
@@ -40,6 +44,7 @@ use xmas_elf::{
 /// - `address_space`：Sv39 地址空间，管理该进程的页表
 /// - `heap_bottom`：堆底地址（ELF 加载的最高地址的下一页）
 /// - `program_brk`：当前堆顶地址（通过 sbrk 调整）
+/// - `syscall_count`：按系统调用号统计的调用次数（供 `trace` 请求 2 查询）
 pub struct Process {
     /// 用户态上下文（含 satp，支持跨地址空间的 Trap 切换）
     pub context: ForeignContext,
@@ -49,6 +54,8 @@ pub struct Process {
     pub heap_bottom: usize,
     /// 当前程序 break 位置（堆顶）
     pub program_brk: usize,
+    /// 按系统调用号统计的调用次数（装箱以避免进程结构体过大导致内核栈溢出）
+    pub syscall_count: Box<[u32; MAX_SYSCALL]>,
 }
 
 impl Process {
@@ -150,7 +157,26 @@ impl Process {
             address_space,
             heap_bottom,
             program_brk: heap_bottom,
+            syscall_count: Box::new([0; MAX_SYSCALL]),
         })
+    }
+
+    /// 把 VirtIO-GPU 帧缓冲映射进本进程用户空间固定虚址 `0x4000_0000`。
+    ///
+    /// `paddr` 为帧缓冲物理地址（页对齐），`len` 为字节长度。映射标志含 `U`
+    /// 位，否则用户访问帧缓冲会触发 PageFault（见蓝图 E 节）。该区间位于
+    /// ELF/堆（低地址）与用户栈（`1<<38` 附近）之间，不与二者重叠。
+    #[cfg(feature = "game")]
+    pub fn map_framebuffer(&mut self, paddr: usize, len: usize) {
+        const FB_BASE: usize = 0x4000_0000;
+        const PAGE_SIZE: usize = 1 << Sv39::PAGE_BITS;
+        let pages = (len + PAGE_SIZE - 1) >> Sv39::PAGE_BITS;
+        let vpn_start = VAddr::<Sv39>::new(FB_BASE).floor();
+        self.address_space.map_extern(
+            vpn_start..vpn_start + pages,
+            PPN::new(paddr >> Sv39::PAGE_BITS),
+            build_flags("U_WRV"),
+        );
     }
 
     /// 修改程序 break 位置（实现 sbrk 系统调用）。

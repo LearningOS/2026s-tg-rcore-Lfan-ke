@@ -55,6 +55,13 @@ mod processor;
 /// VirtIO 块设备驱动
 mod virtio_block;
 
+// 图形游戏基建（feature = "game"）：VirtIO-GPU 帧缓冲 + VirtIO-Input 键盘。
+// 复用第四章基建，仅改 MMIO 槽位与 HAL 地址翻译以适配第七章环境。
+#[cfg(feature = "game")]
+mod gpu;
+#[cfg(feature = "game")]
+mod input;
+
 #[macro_use]
 extern crate tg_console;
 
@@ -209,8 +216,21 @@ extern "C" fn rust_main() -> ! {
     tg_syscall::init_scheduling(&SyscallContext);
     tg_syscall::init_clock(&SyscallContext);
     tg_syscall::init_signal(&SyscallContext);   // 本章新增：初始化信号系统调用
-    // 步骤 8：从文件系统加载初始进程 initproc
-    let initproc = read_all(FS.open("initproc", OpenFlags::RDONLY).unwrap());
+    // 步骤 7.5（feature = "game"）：初始化 VirtIO-GPU 与键盘，并注册图形系统调用。
+    // 必须在 kernel_space（KERNEL_SPACE 写入 + GPU/键盘 MMIO 映射）之后。
+    #[cfg(feature = "game")]
+    {
+        gpu::init();
+        tg_syscall::init_gpu(&SyscallContext);
+    }
+    // 步骤 8：从文件系统加载初始进程。
+    // 默认判题路径加载 initproc；feature = "game" 直接加载图形 Pong（裁判进程），
+    // 由它 fork 出两个玩家进程并经管道对战。
+    #[cfg(not(feature = "game"))]
+    let init_name = "initproc";
+    #[cfg(feature = "game")]
+    let init_name = "pong";
+    let initproc = read_all(FS.open(init_name, OpenFlags::RDONLY).unwrap());
     if let Some(process) = Process::from_elf(ElfFile::new(initproc.as_slice()).unwrap()) {
         PROCESSOR.get_mut().set_manager(ProcManager::new());
         PROCESSOR
@@ -334,6 +354,19 @@ fn kernel_space(layout: tg_linker::KernelLayout, memory: usize, portal: usize) {
             build_flags("_WRV"),
         );
     }
+    // 图形游戏额外映射 GPU（bus.1 = 0x1000_2000）与键盘（bus.2 = 0x1000_3000）
+    // 的 MMIO 寄存器，供 gpu.rs / input.rs 驱动直访（内核专属，恒等映射）。
+    #[cfg(feature = "game")]
+    for base in [0x1000_2000usize, 0x1000_3000] {
+        let s = VAddr::<Sv39>::new(base);
+        let e = VAddr::<Sv39>::new(base + 0x1000);
+        log::info!("MMIO range -> {:#10x}..{:#10x}", s.val(), e.val());
+        space.map_extern(
+            s.floor()..e.ceil(),
+            PPN::new(s.floor().val()),
+            build_flags("_WRV"),
+        );
+    }
 
     // 激活 Sv39 分页模式
     unsafe { satp::set(satp::Mode::Sv39, 0, space.root_ppn().val()) };
@@ -361,7 +394,11 @@ mod impls {
         processor::ProcManager,
         Sv39, PROCESSOR,
     };
-    use alloc::{alloc::alloc_zeroed, string::String, vec::Vec};
+    use alloc::{
+        alloc::{alloc_zeroed, dealloc},
+        string::String,
+        vec::Vec,
+    };
     use core::{alloc::Layout, ptr::NonNull};
     use spin::Mutex;
     use tg_console::log;
@@ -428,11 +465,26 @@ mod impls {
             *flags |= Self::OWNED;
             NonNull::new(Self::page_alloc(len)).unwrap()
         }
-        fn deallocate(&mut self, _pte: Pte<Sv39>, _len: usize) -> usize {
-            todo!()
+        /// 释放 `allocate` 分配的 `len` 个物理页（与分配时同样按页对齐）。
+        fn deallocate(&mut self, pte: Pte<Sv39>, len: usize) -> usize {
+            let p = self.p_to_v::<u8>(pte.ppn());
+            unsafe {
+                dealloc(
+                    p.as_ptr(),
+                    Layout::from_size_align_unchecked(len << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS),
+                );
+            }
+            len
         }
+
+        /// 释放根页表所在的物理页（1 页）。
         fn drop_root(&mut self) {
-            todo!()
+            unsafe {
+                dealloc(
+                    self.0.as_ptr() as *mut u8,
+                    Layout::from_size_align_unchecked(1 << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS),
+                );
+            }
         }
     }
 
@@ -846,6 +898,59 @@ mod impls {
             } else {
                 -1
             }
+        }
+    }
+
+    /// 图形 / 输入系统调用实现（自定义 syscall 2000/2001/2002）。
+    ///
+    /// - `framebuffer_info`：**首次调用时**把帧缓冲按需映射进调用进程的
+    ///   `0x4000_0000`，再把虚址/长度/分辨率写回用户 `FbInfo`。按需映射使得
+    ///   只有真正渲染的“裁判”进程持有这片帧缓冲，玩家子进程（先于本调用
+    ///   被 fork）不会继承它。
+    /// - `gpu_flush`：触发 VirtIO-GPU flush，把帧缓冲推到屏幕。
+    /// - `key_event`：非阻塞读取一个 VirtIO-Input 按键。
+    #[cfg(feature = "game")]
+    impl Gpu for SyscallContext {
+        fn framebuffer_info(&self, _caller: Caller, info: usize) -> isize {
+            const FB_BASE: usize = 0x4000_0000;
+            // 帧缓冲是否已映射进本进程（含 U 位即视为已映射）。
+            const MAPPED: VmFlags<Sv39> = build_flags("U_V");
+            let current = PROCESSOR.get_mut().current().unwrap();
+            if current
+                .address_space
+                .translate::<u8>(VAddr::new(FB_BASE), MAPPED)
+                .is_none()
+            {
+                current.map_framebuffer(crate::gpu::fb_paddr(), crate::gpu::fb_len());
+            }
+            // 用户传入的 FbInfo 指针需可写（用户栈，含 U 位）。
+            const WRITABLE: VmFlags<Sv39> = build_flags("U_WV");
+            if let Some(mut ptr) = current
+                .address_space
+                .translate::<FbInfo>(VAddr::new(info), WRITABLE)
+            {
+                *unsafe { ptr.as_mut() } = FbInfo {
+                    ptr: FB_BASE,
+                    len: crate::gpu::fb_len(),
+                    width: crate::gpu::fb_width(),
+                    height: crate::gpu::fb_height(),
+                };
+                0
+            } else {
+                log::error!("framebuffer_info: user ptr not writable");
+                -1
+            }
+        }
+
+        #[inline]
+        fn gpu_flush(&self, _caller: Caller) -> isize {
+            crate::gpu::flush();
+            0
+        }
+
+        #[inline]
+        fn key_event(&self, _caller: Caller) -> isize {
+            crate::input::poll_key().map_or(0, |code| code as isize)
         }
     }
 }
